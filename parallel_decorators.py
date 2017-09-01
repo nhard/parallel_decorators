@@ -37,14 +37,56 @@ from functools import wraps
 import traceback
 
 
+# some MPI helper functions
 def is_master():
     """return True if current rank is master"""
-    from mpi4py import MPI
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    return rank == 0
+    try:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        return rank == 0
+    except ImportError:
+        return True
 
 
+def is_mpi():
+    try:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        size = comm.Get_size()
+        return size > 1
+    except ImportError:
+        return False
+
+
+def mpi_size():
+    try:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        return comm.Get_size()
+    except ImportError:
+        return 1
+
+
+def mpi_rank():
+    try:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        return comm.Get_rank()
+    except ImportError:
+        return 0
+
+
+def mpi_barrier():
+    try:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        comm.Barrier()
+    except ImportError:
+        pass
+
+
+# more helper functions
 def is_iterable(xs):
     """returns True if xs is an iterable"""
     # try to get iterator; if error occurs, xs is not iterable
@@ -55,6 +97,15 @@ def is_iterable(xs):
     return True
 
 
+def staticvariables(**variables):
+    def decorate(function):
+        for variable in variables:
+            setattr(function, variable, variables[variable])
+        return function
+    return decorate
+
+
+# vectorization functions down here
 def vectorize(f):
     """decorator for vectorization of functions
 
@@ -74,7 +125,7 @@ def vectorize(f):
     return newfun
 
 
-def vectorize_queue(num_procs=2, use_progressbar=False):
+def vectorize_queue(num_procs=2, use_progressbar=False, label=None):
     """decorator for parallel vectorization of functions using processes
 
     Function wrapper that vectorizes f over the first argument
@@ -91,17 +142,20 @@ def vectorize_queue(num_procs=2, use_progressbar=False):
     >>> power(range(5), 3)
     [0, 1, 8, 27, 64]
     """
+    show_progressbar = False
     if use_progressbar:
         try:
             from progressbar import Bar, AdaptiveETA, Percentage, ProgressBar,\
                     FormatLabel
-        except ModuleNotFoundError:
+            show_progressbar = True
+        except ImportError:
             print("Progressbar requested, but module progressbar not found."
                   " Disabling progressbar.")
-            use_progressbar = False
 
+    @staticvariables(show_progressbar=show_progressbar)
     def decorator(f):
         """the decorator function we return"""
+        @staticvariables(show_progressbar=decorator.show_progressbar)
         @wraps(f)
         def newfun(xs, *args, **kwargs):
             """the function that replaces the wrapped function"""
@@ -109,10 +163,16 @@ def vectorize_queue(num_procs=2, use_progressbar=False):
                 # no iteration, simply call function
                 return f(xs, *args, **kwargs)
 
+            show_progressbar = newfun.show_progressbar
+
             from multiprocessing import Process, Queue
 
-            if use_progressbar:
-                widgets = [FormatLabel(f.__name__), ' ', Percentage(),
+            if show_progressbar:
+                if label is None:
+                    bar_label = f.__name__
+                else:
+                    bar_label = label
+                widgets = [FormatLabel(bar_label), ' ', Percentage(),
                            Bar(), AdaptiveETA()]
                 pbar = ProgressBar(widgets=widgets, maxval=len(xs))
                 pbar.start()
@@ -153,14 +213,14 @@ def vectorize_queue(num_procs=2, use_progressbar=False):
                 # caught exception?
                 if e is not None:
                     errors.append(e)
-                if use_progressbar:
+                if show_progressbar:
                     pbar.update(i)
 
             # stop workers
             for i in range(num_procs):
                 task_queue.put('STOP')
 
-            if use_progressbar:
+            if show_progressbar:
                 pbar.finish()
 
             # error ocurred?
@@ -173,7 +233,7 @@ def vectorize_queue(num_procs=2, use_progressbar=False):
     return decorator
 
 
-def vectorize_mpi(f):
+def vectorize_mpi(use_progressbar=False, label=None, scheduling='auto'):
     """Decorator for parallel vectorization of functions using MPI
 
     Function wrapper that vectorizes f over the first argument
@@ -183,7 +243,7 @@ def vectorize_mpi(f):
 
     Usage:
 
-    >>> @vectorize_mpi
+    >>> @vectorize_mpi()
     ... def power(x, y):
     ...    return x**y
     >>> # computation in parallel here
@@ -196,71 +256,207 @@ def vectorize_mpi(f):
     then start script with
     $ mpiexec -np <num> python script.py
     """
-    @wraps(f)
-    def newfun(xs, *args, **kwargs):
-        """the function that replaces the wrapped function"""
-        if not is_iterable(xs):
-            # no iteration, simply call function
-            return f(xs, *args, **kwargs)
+    show_progressbar = False
+    if use_progressbar:
+        try:
+            from progressbar import Bar, AdaptiveETA, Percentage, ProgressBar,\
+                    FormatLabel
+            show_progressbar = True
+        except ImportError:
+            print("Progressbar requested, but module progressbar not found."
+                  " Disabling progressbar.")
 
-        from mpi4py import MPI
-        comm = MPI.COMM_WORLD
-        size = comm.Get_size()
-        rank = comm.Get_rank()
+    @staticvariables(show_progressbar=show_progressbar)
+    def decorator(f):
+        @wraps(f)
+        @staticvariables(show_progressbar=decorator.show_progressbar)
+        def newfun(xs, *args, **kwargs):
+            """the function that replaces the wrapped function"""
+            show_progressbar = newfun.show_progressbar
 
-        # only one process
-        if size == 1:
-            return vectorize(f)(xs, *args, **kwargs)
+            from mpi4py import MPI
+            comm = MPI.COMM_WORLD
+            size = comm.Get_size()
+            rank = comm.Get_rank()
 
-        result = [None] * len(xs)
+            if rank != 0:
+                show_progressbar = False
+            pbar = None
 
-        # compute results
-        # NICE TO HAVE: implement better load balancing; right now simplest
-        #   distribution of tasks to processes
-        for i, x in enumerate(xs):
-            if rank == i % size:
-                result[i] = f(x, *args, **kwargs)
+            # first broadcast array from root
+            xs = comm.bcast(xs, root=0)
 
-        comm.Barrier()
+            if not is_iterable(xs):
+                # no iteration, simply call function
+                return f(xs, *args, **kwargs)
 
-        # communicate results
+            # only one process
+            if size == 1:
+                return vectorize(f)(xs, *args, **kwargs)
 
-        # for the easy load balancing
-        # communicate everything to root
-        for i in range(len(xs)):
-            if i % size == 0:
-                # already there
-                continue
-            if rank == i % size:
-                # process that sends
-                comm.send(result[i], dest=0, tag=0)
-            elif rank == 0:
-                # root receives
-                result[i] = comm.recv(source=(i % size), tag=0)
-        comm.Barrier()
+            result = [None] * len(xs)
+            error = None
 
-        # distribute data to all cores
-        for i in range(len(xs)):
-            if rank == 0:
-                # root sends to all processes
-                for j in range(size):
-                    comm.send(result[i], dest=j, tag=1)
+            comm.Barrier()
+
+            # simple task distribution for less than 4 tasks or if indicated by
+            # parameter scheduling
+            # otherwise use slave-master model
+            if (scheduling == 'static' or (scheduling == 'auto' and size < 4))\
+                    and not (scheduling == 'dynamic'):
+                # compute results
+                for i, x in enumerate(xs):
+                    if rank == i % size:
+                        result[i] = f(x, *args, **kwargs)
+                # communicate results
+                # for the easy load balancing
+                for i in range(len(xs)):
+                    if i % size == 0:
+                        # already there
+                        continue
+                    if rank == i % size:
+                        # process that sends
+                        comm.send(result[i], dest=0, tag=0)
+                    elif rank == 0:
+                        # root receives
+                        result[i] = comm.recv(source=(i % size), tag=0)
             else:
-                # each process receives from root
-                result[i] = comm.recv(source=0, tag=1)
-        comm.Barrier()
-        return result
-    return newfun
+                if rank == 0:
+                    # create progressbar
+                    if show_progressbar:
+                        if label is None:
+                            bar_label = f.__name__
+                        else:
+                            bar_label = label
+                        widgets = [FormatLabel(bar_label), ' ', Percentage(),
+                                   Bar(), AdaptiveETA()]
+                        pbar = ProgressBar(widgets=widgets, maxval=len(xs))
+                        pbar.start()
+                    # master process -> handles distribution of tasks
+                    all_sent = False
+                    current = 0
+                    ranks = [None] * len(xs)
+                    reqs_sent = []
+                    reqs_rcvd = []
+                    completed_reqs = []
+                    # send first batch of tasks
+                    for i in range(1, size):
+                        ranks[current] = i
+                        reqs_sent.append(comm.isend((current, None),
+                                         dest=i, tag=0))
+                        reqs_rcvd.append(comm.irecv(source=i, tag=current))
+                        if current < len(xs):
+                            current += 1
+                        else:
+                            break
+                    for r in reqs_sent:
+                        r.wait()
+                    while True:
+                        new_reqs = []
+                        for i, r in enumerate(reqs_rcvd):
+                            # check for completed requests
+                            completed, data = r.test()
+                            if completed:
+                                if data is None:
+                                    continue
+                                completed_reqs.append(i)
+                                if data[2] is not None:
+                                    error = data[2]
+                                result[data[0]] = data[1]
+                                # check if all tasks have been distributed
+                                if current >= len(xs):
+                                    all_sent = True
+                                    continue
+                                ranks[current] = ranks[data[0]]
+                                # send new taks and get result (asynchronously)
+                                comm.send((current, None),
+                                          dest=ranks[data[0]], tag=0)
+                                new_reqs.append(comm.irecv(
+                                    source=ranks[data[0]], tag=current))
+                                current += 1
+                        for r in new_reqs:
+                            reqs_rcvd.append(r)
+                        if all_sent and len(completed_reqs) == len(xs):
+                            # send None to all processes to exit loop
+                            req_finished = []
+                            for r in range(1, size):
+                                req_finished.append(comm.isend(
+                                    (None, None), dest=r, tag=0))
+                            for req in req_finished:
+                                req.wait()
+                            break
+                        # check if error occurred and propagate to slaves
+                        if error is not None:
+                            for r in range(1, size):
+                                comm.send((None, error), dest=r, tag=0)
+                            break
+                        # update progressbar
+                        if show_progressbar:
+                            pbar.update(len(completed_reqs))
+                else:
+                    # slave processes -> do the computation
+                    current, e = comm.recv(source=0, tag=0)
+                    while True:
+                        # compute result for index current
+                        try:
+                            res = f(xs[current], *args, **kwargs)
+                            comm.send((current, res, None),
+                                      dest=0, tag=current)
+                        except Exception as e:
+                            print("Caught exception in parallel vectorized "
+                                  "function:")
+                            # print out traceback
+                            traceback.print_exc()
+                            print()
+                            comm.send((current, None, e), dest=0, tag=current)
+                        # receive next task
+                        current, e = comm.recv(source=0, tag=0)
+                        # exit loop if None is sent
+                        if current is None:
+                            if e is not None:
+                                error = e
+                            break
+
+            comm.Barrier()
+
+            if show_progressbar and pbar is not None:
+                pbar.finish()
+
+            # check for error
+            if error is not None:
+                if rank == 0:
+                    raise error
+                return
+
+            # distribute data to all cores
+            for i in range(len(xs)):
+                if rank == 0:
+                    # root sends to all processes
+                    for j in range(size):
+                        comm.send(result[i], dest=j, tag=1)
+                else:
+                    # each process receives from root
+                    result[i] = comm.recv(source=0, tag=1)
+            comm.Barrier()
+            return result
+        return newfun
+    return decorator
 
 
-def vectorize_parallel(method='processes', num_procs=2, use_progressbar=False):
+def vectorize_parallel(method='processes', num_procs=2, use_progressbar=False,
+                       label=None, scheduling='auto'):
     """Decorator for parallel vectorization of functions
 
     -- method: can be 'processes' for shared-memory parallelization or 'MPI'
-       for distributed memory parallelization
+       for distributed memory parallelization or 'adaptive' to use MPI if it is
+       active (caution: mpi4py must be installed for using mpi!)
     -- num_procs: number of processors for method == 'processes'
-    -- use_progressbar: for method == 'processes', this indicates if a
-       progress bar should be printed; requires progressbar module
+    -- use_progressbar: this indicates if a progress bar should be printed;
+       requires progressbar module
+    -- label: for use_progressbar==True, this sets the label of the
+       progress bar. Defaults to the name of the decorated function.
+    -- scheduling: scheduling method to use for method == 'MPI'; can be
+       'auto', 'static', or 'dynamic'
 
     Example for multiprocessing:
 
@@ -288,9 +484,14 @@ def vectorize_parallel(method='processes', num_procs=2, use_progressbar=False):
     Then start script with
     $ mpiexec -np <num> python script.py
     """
+    if method == 'adaptive':
+        if is_mpi():
+            method = 'MPI'
+        else:
+            method = 'processes'
     if method == 'processes':
-        return vectorize_queue(num_procs, use_progressbar)
+        return vectorize_queue(num_procs, use_progressbar, label)
     elif method == 'MPI':
-        return vectorize_mpi
+        return vectorize_mpi(use_progressbar, label, scheduling)
     else:
         return vectorize
